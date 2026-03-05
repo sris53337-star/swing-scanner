@@ -2,10 +2,22 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
+import requests as req
 import os
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Telegram Config ──────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = "8635343116:AAHIbzRJfySP353WumkWpXn2iZcdKT9zIzU"   
+TELEGRAM_CHAT_ID = "2071169564"     
+
+def send_telegram(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        req.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"})
+    except:
+        pass
 
 def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -34,6 +46,9 @@ def load_watchlist():
     except:
         return ["PNB.NS", "COALINDIA.NS", "BHEL.NS"]
 
+# Track sent signals to avoid duplicate alerts
+sent_signals = {}
+
 @app.route("/watchlist")
 def get_watchlist():
     return jsonify(load_watchlist())
@@ -46,7 +61,7 @@ def scan(ticker):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
 
-        if len(df) < 60:
+        if len(df) < 30:
             return jsonify({"error": "Not enough data"}), 404
 
         df['EMA20']   = compute_ema(df['Close'], 20)
@@ -105,6 +120,27 @@ def scan(ticker):
             target = round(price - target_points, 2)
         else:
             entry = sl = target = None
+
+        # ── Send Telegram alert for strong signals only ──
+        if signal in ("BULLISH", "BEARISH"):
+            signal_key = f"{ticker}_{signal}"
+            if sent_signals.get(signal_key) != round(price):
+                sent_signals[signal_key] = round(price)
+                emoji = "🚀" if signal == "BULLISH" else "⚠️"
+                msg = (
+                    f"{emoji} <b>SWING {signal}</b>\n"
+                    f"📌 <b>{ticker}</b> @ ₹{round(price,2)}\n\n"
+                    f"✅ Entry:  ₹{entry}\n"
+                    f"🛑 SL:     ₹{sl}\n"
+                    f"🎯 Target: ₹{target}\n\n"
+                    f"📊 RSI: {rsi} | Vol: {vol_ratio}x\n"
+                    f"📈 Trend: {'UP ✅' if trending_up else 'DOWN ❌'}\n"
+                    f"📉 EMA20: ₹{round(ema20,2)} | EMA50: ₹{round(ema50,2)}\n"
+                    f"⚡ ATR: ₹{round(atr,2)}\n\n"
+                    f"📅 Hold: 5-15 days\n"
+                    f"💰 SL = 2x ATR | Target = 4x ATR"
+                )
+                send_telegram(msg)
 
         return jsonify({
             "ticker":      ticker,
