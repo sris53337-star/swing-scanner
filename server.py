@@ -9,7 +9,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Telegram Config ──────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = "8635343116:AAHIbzRJfySP353WumkWpXn2iZcdKT9zIzU"   
+TELEGRAM_TOKEN   = "AAHIbzRJfySP353WumkWpXn2iZcdKT9zIzU"   
 TELEGRAM_CHAT_ID = "2071169564"     
 
 def send_telegram(message):
