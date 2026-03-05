@@ -68,8 +68,8 @@ def scan(ticker):
         vol_avg   = int(last['VOL_AVG'])
         vol_ratio = round(volume / vol_avg, 2) if vol_avg > 0 else 0
 
-        if price > 200:
-            return jsonify({"error": f"Price over ₹200"}), 400
+        if price > 500:
+            return jsonify({"error": f"Price over ₹500"}), 400
 
         ema_bullish  = float(prev['EMA20']) <= float(prev['EMA50']) and ema20 > ema50
         ema_bearish  = float(prev['EMA20']) >= float(prev['EMA50']) and ema20 < ema50
