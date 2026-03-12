@@ -6,75 +6,59 @@ import requests as req
 import os
 import threading
 import time
-import io
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import gc
+import json
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=False)
 
-# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SHEETS_URL       = "https://script.google.com/macros/s/AKfycbzu0aDb-n4re6qw_RtkkAYA-EbdhQcTnS9DoDd4wxhb4DTMKE89SUFxqtoeAa2mBx_V/exec"
 CAPITAL          = 5000
 RISK_PCT         = 2
+BROKERAGE        = 40
+MIN_GAIN         = 50
+MIN_VOL          = 0.5
+COOLDOWN_DAYS    = 3
 
 sent_signals  = {}
 active_trades = {}
-eod_sent      = False
+_signal_times = {}
+TRADES_FILE   = "swing_trades.json"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def save_trades():
+    try:
+        with open(TRADES_FILE, "w") as f:
+            json.dump(active_trades, f)
+    except:
+        pass
+
+def load_trades():
+    try:
+        with open(TRADES_FILE, "r") as f:
+            data = json.load(f)
+            active_trades.update(data)
+            print(f"Restored {len(data)} swing trades")
+    except:
+        pass
+
+load_trades()
+
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         req.post(url, json={
-            "chat_id":    TELEGRAM_CHAT_ID,
-            "text":       message,
-            "parse_mode": "HTML"
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "text":                     message,
+            "parse_mode":               "HTML",
+            "disable_web_page_preview": True
         }, timeout=10)
     except:
         pass
-
-def send_telegram_photo(image_bytes, caption=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        req.post(url, data={
-            "chat_id":    TELEGRAM_CHAT_ID,
-            "caption":    caption,
-            "parse_mode": "HTML"
-        }, files={"photo": ("chart.png", image_bytes, "image/png")}, timeout=15)
-    except:
-        pass
-
-def send_telegram_album(images, caption=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        import json
-        url   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMediaGroup"
-        files = {}
-        media = []
-        for i, img_bytes in enumerate(images):
-            key = f"photo{i}"
-            files[key] = (f"chart{i}.png", img_bytes, "image/png")
-            item = {"type": "photo", "media": f"attach://{key}"}
-            if i == 0:
-                item["caption"]    = caption
-                item["parse_mode"] = "HTML"
-            media.append(item)
-        req.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "media":   json.dumps(media)
-        }, files=files, timeout=20)
-    except Exception as e:
-        print(f"Album error: {e}")
 
 def log_to_sheets(data):
     try:
@@ -96,7 +80,7 @@ def compute_atr(df, period=14):
     high_low   = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close  = (df['Low']  - df['Close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    tr = high_low.combine(high_close, max).combine(low_close, max)
     return tr.rolling(window=period).mean()
 
 def calculate_position_size(entry, sl):
@@ -104,9 +88,7 @@ def calculate_position_size(entry, sl):
     risk_per_share = abs(entry - sl)
     if risk_per_share == 0 or entry == 0:
         return 0, 0, 0, 0
-    risk_based    = int(risk_amount / risk_per_share)
-    capital_based = int(CAPITAL / entry)
-    shares        = min(risk_based, capital_based)
+    shares = min(int(risk_amount / risk_per_share), int(CAPITAL / entry))
     if shares <= 0:
         return 0, 0, 0, 0
     cost     = round(shares * entry, 2)
@@ -117,244 +99,33 @@ def calculate_position_size(entry, sl):
 def load_watchlist():
     try:
         with open("watchlist.txt", "r") as f:
-            return [line.strip() for line in f
-                    if line.strip() and not line.startswith('#')]
+            return [l.strip() for l in f if l.strip() and not l.startswith('#')]
     except:
         return ["PNB.NS", "BHEL.NS", "COALINDIA.NS"]
 
-# ── Chart Generator ───────────────────────────────────────────────────────────
-def generate_chart(ticker, signal, entry, sl, target,
-                   interval="1d", period="3mo", title="DAILY",
-                   ema_fast=20, ema_slow=50):
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
-        if len(df) < 10:
-            return None
-
-        df = df.tail(60)
-        df['EMA_FAST'] = compute_ema(df['Close'], ema_fast)
-        df['EMA_SLOW'] = compute_ema(df['Close'], ema_slow)
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
-                                        gridspec_kw={'height_ratios': [3, 1]},
-                                        facecolor='#0a0a0a')
-        ax1.set_facecolor('#0d0d0d')
-        ax2.set_facecolor('#0d0d0d')
-
-        # Candles
-        for i, (idx, row) in enumerate(df.iterrows()):
-            o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
-            color = '#00ff88' if c >= o else '#ff4455'
-            ax1.plot([i, i], [l, h], color=color, linewidth=0.8, alpha=0.7)
-            ax1.bar(i, abs(c - o), bottom=min(c, o),
-                    color=color, alpha=0.85, width=0.6)
-
-        # EMA lines
-        ax1.plot(range(len(df)), df['EMA_FAST'].values,
-                 color='#58a6ff', linewidth=1.8,
-                 label=f'EMA{ema_fast}', alpha=0.9)
-        ax1.plot(range(len(df)), df['EMA_SLOW'].values,
-                 color='#ff8800', linewidth=1.8,
-                 label=f'EMA{ema_slow}', alpha=0.9)
-
-        # Entry / SL / Target lines
-        ax1.axhline(y=entry,  color='#58a6ff', linestyle='--', linewidth=1.2, alpha=0.8)
-        ax1.axhline(y=sl,     color='#ff4455', linestyle='--', linewidth=1.2, alpha=0.8)
-        ax1.axhline(y=target, color='#00ff88', linestyle='--', linewidth=1.2, alpha=0.8)
-
-        ax1.text(len(df)-1, target, f' TGT ₹{target}', color='#00ff88',
-                 fontsize=7, va='bottom', fontfamily='monospace')
-        ax1.text(len(df)-1, entry,  f' ENT ₹{entry}',  color='#58a6ff',
-                 fontsize=7, va='bottom', fontfamily='monospace')
-        ax1.text(len(df)-1, sl,     f' SL  ₹{sl}',     color='#ff4455',
-                 fontsize=7, va='top',    fontfamily='monospace')
-
-        # Volume
-        for i, (idx, row) in enumerate(df.iterrows()):
-            color = '#00ff8840' if row['Close'] >= row['Open'] else '#ff445540'
-            ax2.bar(i, row['Volume'], color=color, width=0.6)
-
-        # Styling
-        sig_color = '#00ff88' if signal == 'BULLISH' else '#ff4455'
-        sig_emoji = '🚀' if signal == 'BULLISH' else '⚠️'
-        ax1.set_title(
-            f'{sig_emoji} {ticker.replace(".NS","")} — SWING {signal} | {title} CHART',
-            color=sig_color, fontsize=11, fontfamily='monospace',
-            fontweight='bold', pad=8
-        )
-
-        for ax in [ax1, ax2]:
-            ax.tick_params(colors='#444', labelsize=7)
-            for spine in ax.spines.values():
-                spine.set_color('#222')
-
-        ax1.tick_params(axis='x', labelbottom=False)
-        ax1.set_ylabel('Price (₹)', color='#444', fontsize=8)
-        ax2.set_ylabel('Volume',    color='#444', fontsize=8)
-
-        step = max(1, len(df)//6)
-        ax2.set_xticks(range(0, len(df), step))
-        fmt = '%d %b' if interval in ('1d', '1wk') else '%d %b %H:%M'
-        ax2.set_xticklabels(
-            [df.index[i].strftime(fmt) for i in range(0, len(df), step)],
-            rotation=20, fontsize=6, color='#444'
-        )
-        ax1.legend(loc='upper left', facecolor='#111', edgecolor='#222',
-                   labelcolor='white', fontsize=8)
-
-        plt.tight_layout(pad=1.0)
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=120,
-                    facecolor='#0a0a0a', bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return buf.read()
-
-    except Exception as e:
-        print(f"Chart error {title}: {e}")
-        return None
-
-def generate_all_charts(ticker, signal, entry, sl, target):
-    """Generate 3 swing charts: 1HR, DAILY, WEEKLY"""
-    charts = []
-
-    # Chart 1: 1 Hour — entry timing
-    c1 = generate_chart(ticker, signal, entry, sl, target,
-                        interval="1h", period="1mo",
-                        title="1 HOUR", ema_fast=9, ema_slow=21)
-    if c1: charts.append(c1)
-
-    # Chart 2: Daily — main signal
-    c2 = generate_chart(ticker, signal, entry, sl, target,
-                        interval="1d", period="3mo",
-                        title="DAILY", ema_fast=20, ema_slow=50)
-    if c2: charts.append(c2)
-
-    # Chart 3: Weekly — big picture
-    c3 = generate_chart(ticker, signal, entry, sl, target,
-                        interval="1wk", period="2y",
-                        title="WEEKLY", ema_fast=10, ema_slow=20)
-    if c3: charts.append(c3)
-
-    return charts
-
-def generate_result_chart(ticker, signal, entry, sl, target,
-                          exit_price, result, pnl, shares):
-    try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna().tail(60)
-        df['EMA20'] = compute_ema(df['Close'], 20)
-        df['EMA50'] = compute_ema(df['Close'], 50)
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
-                                        gridspec_kw={'height_ratios': [3, 1]},
-                                        facecolor='#0a0a0a')
-        ax1.set_facecolor('#0d0d0d')
-        ax2.set_facecolor('#0d0d0d')
-
-        for i, (idx, row) in enumerate(df.iterrows()):
-            o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
-            color = '#00ff88' if c >= o else '#ff4455'
-            ax1.plot([i, i], [l, h], color=color, linewidth=0.8, alpha=0.7)
-            ax1.bar(i, abs(c - o), bottom=min(c, o),
-                    color=color, alpha=0.85, width=0.6)
-
-        ax1.plot(range(len(df)), df['EMA20'].values,
-                 color='#58a6ff', linewidth=1.8, label='EMA20')
-        ax1.plot(range(len(df)), df['EMA50'].values,
-                 color='#ff8800', linewidth=1.8, label='EMA50')
-
-        # Shade profit/loss zone
-        is_win = "TARGET" in result
-        ax1.axhspan(min(entry, exit_price), max(entry, exit_price),
-                    alpha=0.25, color='#00ff88' if is_win else '#ff4455')
-
-        ax1.axhline(y=entry,      color='#58a6ff', linestyle='--', linewidth=1.5)
-        ax1.axhline(y=sl,         color='#ff4455', linestyle='--', linewidth=1.0, alpha=0.6)
-        ax1.axhline(y=target,     color='#00ff88', linestyle='--', linewidth=1.0, alpha=0.6)
-        ax1.axhline(y=exit_price, color='#ffcc00', linestyle='-',  linewidth=2.0)
-
-        ax1.text(len(df)-1, target,     f' TGT ₹{target}',     color='#00ff88', fontsize=7, va='bottom', fontfamily='monospace')
-        ax1.text(len(df)-1, entry,      f' ENT ₹{entry}',      color='#58a6ff', fontsize=7, va='bottom', fontfamily='monospace')
-        ax1.text(len(df)-1, sl,         f' SL  ₹{sl}',         color='#ff4455', fontsize=7, va='top',    fontfamily='monospace')
-        ax1.text(len(df)-1, exit_price, f' EXIT ₹{exit_price}',color='#ffcc00', fontsize=8, va='bottom', fontfamily='monospace', fontweight='bold')
-
-        pnl_color = '#00ff88' if pnl >= 0 else '#ff4455'
-        pnl_text  = f"{'✅ PROFIT' if pnl >= 0 else '❌ LOSS'}  ₹{abs(pnl)}  ({shares} shares)"
-        ax1.text(0.5, 0.97, pnl_text,
-                 transform=ax1.transAxes,
-                 color=pnl_color, fontsize=10, fontweight='bold',
-                 ha='center', va='top', fontfamily='monospace',
-                 bbox=dict(boxstyle='round,pad=0.3', facecolor='#111',
-                           edgecolor=pnl_color, alpha=0.8))
-
-        for i, (idx, row) in enumerate(df.iterrows()):
-            color = '#00ff8840' if row['Close'] >= row['Open'] else '#ff445540'
-            ax2.bar(i, row['Volume'], color=color, width=0.6)
-
-        result_emoji = "🎯" if "TARGET" in result else "🛑" if "SL" in result else "📤"
-        ax1.set_title(
-            f'{result_emoji} SWING {ticker.replace(".NS","")} — {result} | P&L: ₹{pnl}',
-            color=pnl_color, fontsize=11, fontfamily='monospace',
-            fontweight='bold', pad=8
-        )
-
-        for ax in [ax1, ax2]:
-            ax.tick_params(colors='#444', labelsize=7)
-            for spine in ax.spines.values():
-                spine.set_color('#222')
-
-        ax1.tick_params(axis='x', labelbottom=False)
-        ax1.set_ylabel('Price (₹)', color='#444', fontsize=8)
-        ax2.set_ylabel('Volume',    color='#444', fontsize=8)
-
-        step = max(1, len(df)//6)
-        ax2.set_xticks(range(0, len(df), step))
-        ax2.set_xticklabels(
-            [df.index[i].strftime('%d %b') for i in range(0, len(df), step)],
-            rotation=20, fontsize=6, color='#444'
-        )
-        ax1.legend(loc='upper left', facecolor='#111', edgecolor='#222',
-                   labelcolor='white', fontsize=8)
-
-        plt.tight_layout(pad=1.0)
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=120,
-                    facecolor='#0a0a0a', bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return buf.read()
-
-    except Exception as e:
-        print(f"Result chart error: {e}")
-        return None
-
-# ── Trade Monitor Thread ──────────────────────────────────────────────────────
 def monitor_trades():
-    global eod_sent
+    global eod_sent_date
+    eod_sent_date = ""
     while True:
         try:
-            now = datetime.utcnow()
-            ist_minutes = now.hour * 60 + now.minute + 330
-            ist_hour    = (ist_minutes // 60) % 24
-            ist_minute  = ist_minutes % 60
+            now        = datetime.utcnow()
+            ist_mins   = now.hour * 60 + now.minute + 330
+            ist_hour   = (ist_mins // 60) % 24
+            ist_minute = ist_mins % 60
+            today      = now.strftime("%d-%b-%Y")
 
-            if ist_hour == 15 and ist_minute >= 35 and not eod_sent:
+            if ist_hour == 15 and ist_minute >= 35 and eod_sent_date != today:
                 send_eod_summary()
-                eod_sent = True
+                eod_sent_date = today
 
             if ist_hour == 0 and ist_minute < 5:
-                eod_sent = False
                 sent_signals.clear()
-                active_trades.clear()
+                _signal_times.clear()
+                save_trades()
 
             for ticker in list(active_trades.keys()):
                 trade = active_trades[ticker]
+                df    = None
                 try:
                     df = yf.download(ticker, period="5d", interval="1d", progress=False)
                     if isinstance(df.columns, pd.MultiIndex):
@@ -363,6 +134,9 @@ def monitor_trades():
                         continue
 
                     current_price = float(df['Close'].iloc[-1])
+                    del df
+                    df = None
+
                     entry  = trade['entry']
                     sl     = trade['sl']
                     target = trade['target']
@@ -375,49 +149,34 @@ def monitor_trades():
 
                     if signal == 'BULLISH':
                         if current_price >= target:
-                            result = 'TARGET HIT ✅'
-                            exit_price = target
+                            result, exit_price = 'TARGET HIT', target
                         elif current_price <= sl:
-                            result = 'SL HIT ❌'
-                            exit_price = sl
+                            result, exit_price = 'SL HIT', sl
                     else:
                         if current_price <= target:
-                            result = 'TARGET HIT ✅'
-                            exit_price = target
+                            result, exit_price = 'TARGET HIT', target
                         elif current_price >= sl:
-                            result = 'SL HIT ❌'
-                            exit_price = sl
+                            result, exit_price = 'SL HIT', sl
 
                     if days >= 15 and not result:
-                        result = 'MAX DAYS EXIT 📤'
-                        exit_price = current_price
+                        result, exit_price = 'MAX DAYS EXIT', current_price
 
                     active_trades[ticker]['days'] = days
 
                     if result:
                         pnl   = round(shares * (exit_price - entry) *
-                                      (1 if signal == 'BULLISH' else -1) - 40, 2)
-                        emoji = ("🎯" if "TARGET" in result
-                                 else "🛑" if "SL" in result else "📤")
-
-                        # Send result chart
-                        result_chart = generate_result_chart(
-                            ticker, signal, entry, sl, target,
-                            exit_price, result, pnl, shares
-                        )
-                        if result_chart:
-                            send_telegram_photo(result_chart,
-                                caption=f"{emoji} SWING {ticker.replace('.NS','')} — {result} | P&L: ₹{pnl}")
+                                      (1 if signal == 'BULLISH' else -1) - BROKERAGE, 2)
+                        emoji = "🎯" if "TARGET" in result else "🛑" if "SL" in result else "📤"
 
                         msg = (
                             f"{emoji} <b>SWING {result}</b>\n"
-                            f"📌 <b>{ticker}</b>\n\n"
+                            f"📌 <b>{ticker.replace('.NS','')}</b>\n\n"
                             f"Entry:     ₹{entry}\n"
                             f"Exit:      ₹{exit_price}\n"
                             f"Shares:    {shares}\n"
                             f"Days held: {days}\n\n"
                             f"💰 Net P&L: <b>₹{pnl}</b>\n"
-                            f"(after ₹40 brokerage)"
+                            f"(after ₹{BROKERAGE} brokerage)"
                         )
                         send_telegram(msg)
                         log_to_sheets({
@@ -428,8 +187,15 @@ def monitor_trades():
                             "pnl":        pnl
                         })
                         del active_trades[ticker]
+                        save_trades()
                 except:
                     pass
+                finally:
+                    if df is not None:
+                        del df
+
+            gc.collect()
+
         except:
             pass
         time.sleep(3600)
@@ -440,28 +206,20 @@ def send_eod_summary():
         bullish   = [t for t, d in sent_signals.items() if d.get('signal') == 'BULLISH']
         bearish   = [t for t, d in sent_signals.items() if d.get('signal') == 'BEARISH']
         total     = len(sent_signals)
-
         msg = (
             f"📊 <b>SWING EOD SUMMARY</b> — {datetime.utcnow().strftime('%d %b %Y')}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 BULLISH signals: {len(bullish)}\n"
-            f"⚠️  BEARISH signals: {len(bearish)}\n"
-            f"📈 Total signals:   {total}\n"
-            f"🔍 Stocks scanned:  {len(watchlist)}\n"
+            f"🚀 Bullish: {len(bullish)} | ⚠️ Bearish: {len(bearish)}\n"
+            f"📈 Total: {total} | 🔍 Scanned: {len(watchlist)}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
         )
         if bullish:
-            msg += "🚀 Bullish: " + ", ".join(
-                [t.replace('.NS','').replace('_BULLISH','') for t in bullish]) + "\n"
+            msg += "🚀 " + ", ".join([t.replace('.NS','') for t in bullish]) + "\n"
         if bearish:
-            msg += "⚠️  Bearish: " + ", ".join(
-                [t.replace('.NS','').replace('_BEARISH','') for t in bearish]) + "\n"
+            msg += "⚠️ "  + ", ".join([t.replace('.NS','') for t in bearish]) + "\n"
         if total == 0:
             msg += "😴 No swing signals today\n"
-        msg += (
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📅 Hold 5-15 days for targets!"
-        )
+        msg += "📅 Hold 5-15 days for targets!"
         send_telegram(msg)
     except:
         pass
@@ -469,18 +227,56 @@ def send_eod_summary():
 monitor_thread = threading.Thread(target=monitor_trades, daemon=True)
 monitor_thread.start()
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+def auto_scan_loop():
+    time.sleep(180)
+    print("Swing auto-scan started.")
+    _scan_running = False
+    while True:
+        try:
+            now      = datetime.utcnow()
+            ist_mins = now.hour * 60 + now.minute + 330
+            ist_hour = (ist_mins // 60) % 24
+            ist_min  = ist_mins % 60
+
+            market_open  = (ist_hour > 9) or (ist_hour == 9 and ist_min >= 30)
+            market_close = (ist_hour > 15) or (ist_hour == 15 and ist_min >= 15)
+            in_market    = market_open and not market_close
+
+            if in_market and not _scan_running:
+                _scan_running = True
+                watchlist = load_watchlist()
+                print(f"Swing scan: {len(watchlist)} stocks | IST {ist_hour:02d}:{ist_min:02d}")
+                for ticker in watchlist:
+                    try:
+                        with app.test_request_context():
+                            scan(ticker)
+                    except Exception as e:
+                        print(f"Swing scan error {ticker}: {e}")
+                    time.sleep(3)
+                gc.collect()
+                _scan_running = False
+            else:
+                print(f"Swing scan: market closed | IST {ist_hour:02d}:{ist_min:02d}")
+        except Exception as e:
+            _scan_running = False
+            print(f"Swing scan loop error: {e}")
+        time.sleep(600)
+
+scan_thread = threading.Thread(target=auto_scan_loop, daemon=True)
+scan_thread.start()
+
 @app.route("/watchlist")
 def get_watchlist():
     return jsonify(load_watchlist())
 
 @app.route("/scan/<ticker>")
 def scan(ticker):
+    df = None
     try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        df = yf.download(ticker, period="6mo", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
+        df = df[['Open','High','Low','Close','Volume']].dropna()
 
         if len(df) < 60:
             return jsonify({"error": "Not enough data"}), 404
@@ -504,6 +300,10 @@ def scan(ticker):
         vol_avg     = int(last['VOL_AVG'])
         vol_ratio   = round(volume / vol_avg, 2) if vol_avg > 0 else 0
         trending_up = price > ema20 > ema50
+        history     = [round(float(x), 2) for x in df['Close'].tail(20).tolist()]
+
+        del df
+        df = None
 
         ema_bullish = float(prev['EMA20']) <= float(prev['EMA50']) and ema20 > ema50
         ema_bearish = float(prev['EMA20']) >= float(prev['EMA50']) and ema20 < ema50
@@ -519,41 +319,42 @@ def scan(ticker):
             signal = "BULLISH"
         elif ema_bearish and vol_ok and not trending_up and rsi_bear_ok:
             signal = "BEARISH"
-        elif trending_up and bull_score >= 3:
-            signal = "WEAK_BULLISH"
-        elif not trending_up and bear_score >= 3:
-            signal = "WEAK_BEARISH"
 
-        # 1:3 RR for swing
-        if signal in ("BULLISH", "WEAK_BULLISH"):
+        if signal in ("BULLISH", "BEARISH"):
             entry  = round(price, 2)
-            sl     = round(price - atr_val * 2, 2)
-            target = round(price + atr_val * 3, 2)
-        elif signal in ("BEARISH", "WEAK_BEARISH"):
-            entry  = round(price, 2)
-            sl     = round(price + atr_val * 2, 2)
-            target = round(price - atr_val * 3, 2)
+            sl     = round(price - atr_val * 2, 2) if signal == "BULLISH" else round(price + atr_val * 2, 2)
+            target = round(price + atr_val * 3, 2) if signal == "BULLISH" else round(price - atr_val * 3, 2)
         else:
             entry = sl = target = None
 
         if signal in ("BULLISH", "BEARISH") and entry and sl:
-            signal_key = f"{ticker}_{signal}"
+            if vol_ratio < MIN_VOL:
+                return jsonify({"ticker": ticker, "price": round(price,2), "signal": signal,
+                                "message": f"Volume {vol_ratio}x too low"})
 
-            if signal_key not in sent_signals:
-                shares, cost, max_loss, max_gain = calculate_position_size(entry, sl)
-                net_gain  = max_gain - 40
+            shares, cost, max_loss, max_gain = calculate_position_size(entry, sl)
+            net_gain = round(max_gain - BROKERAGE, 2)
+
+            if net_gain < MIN_GAIN:
+                return jsonify({"ticker": ticker, "price": round(price,2), "signal": signal,
+                                "message": f"Net gain ₹{net_gain} below minimum ₹{MIN_GAIN}"})
+
+            signal_key = f"{ticker}_{signal}"
+            now_ts     = time.time()
+            last_fired = _signal_times.get(signal_key, 0)
+            cooldown_ok = (now_ts - last_fired) > (COOLDOWN_DAYS * 86400)
+
+            if signal_key not in sent_signals and cooldown_ok:
+                _signal_times[signal_key] = now_ts
+                sent_signals[signal_key]  = {'signal': signal}
+
                 direction = "BUY" if signal == "BULLISH" else "SELL"
                 emoji     = "🚀" if signal == "BULLISH" else "⚠️"
                 tv_symbol = ticker.replace('.NS', '')
 
-                sent_signals[signal_key] = {'signal': signal}
-
-                # Generate 3 swing charts
-                charts = generate_all_charts(ticker, signal, entry, sl, target)
-
                 msg = (
                     f"{emoji} <b>SWING {signal}</b>\n"
-                    f"📌 <b>{ticker}</b> @ ₹{round(price, 2)}\n\n"
+                    f"📌 <b>{tv_symbol}</b> @ ₹{round(price, 2)}\n\n"
                     f"✅ Entry:  ₹{entry}\n"
                     f"🛑 SL:     ₹{sl}\n"
                     f"🎯 Target: ₹{target}\n\n"
@@ -562,7 +363,7 @@ def scan(ticker):
                     f"Cost:      ₹{cost}\n"
                     f"Max Loss:  ₹{max_loss}\n"
                     f"Max Gain:  ₹{max_gain}\n"
-                    f"Brokerage: ₹40\n"
+                    f"Brokerage: ₹{BROKERAGE}\n"
                     f"Net Gain:  ₹{net_gain}\n\n"
                     f"📊 RSI: {rsi} | Vol: {vol_ratio}x\n"
                     f"📈 Trend: {'UP ✅' if trending_up else 'DOWN ❌'}\n"
@@ -572,10 +373,6 @@ def scan(ticker):
                     f"📅 Hold: 5-15 days\n"
                     f"💡 SL = 2x ATR | Target = 3x ATR"
                 )
-
-                if charts:
-                    send_telegram_album(charts,
-                        caption=f"{emoji} SWING {ticker.replace('.NS','')} — {signal}")
                 send_telegram(msg)
 
                 now = datetime.utcnow()
@@ -603,6 +400,7 @@ def scan(ticker):
                     'shares': shares,
                     'days':   0
                 }
+                save_trades()
 
         return jsonify({
             "ticker":      ticker,
@@ -611,8 +409,6 @@ def scan(ticker):
             "ema50":       ema50,
             "rsi":         rsi,
             "atr":         atr_val,
-            "volume":      volume,
-            "vol_avg":     vol_avg,
             "vol_ratio":   vol_ratio,
             "trending_up": trending_up,
             "signal":      signal,
@@ -620,15 +416,19 @@ def scan(ticker):
             "entry":       entry,
             "sl":          sl,
             "target":      target,
-            "hold_days":   "5-15 days",
-            "history":     [round(float(x), 2) for x in df['Close'].tail(20).tolist()]
+            "history":     history
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        if df is not None:
+            del df
+        gc.collect()
 
 @app.route("/backtest/<ticker>")
 def backtest(ticker):
+    df = None
     try:
         period = request.args.get("period", "3mo")
         df = yf.download(ticker, period=period, interval="1d", progress=False)
@@ -637,16 +437,21 @@ def backtest(ticker):
         df = df.dropna()
         if len(df) < 30:
             return jsonify({"error": "Not enough data"}), 404
-        return jsonify({
+        result = {
             "dates":   [str(d)[:10] for d in df.index.tolist()],
             "opens":   [round(float(x), 2) for x in df['Open'].tolist()],
             "highs":   [round(float(x), 2) for x in df['High'].tolist()],
             "lows":    [round(float(x), 2) for x in df['Low'].tolist()],
             "closes":  [round(float(x), 2) for x in df['Close'].tolist()],
             "volumes": [int(x) for x in df['Volume'].tolist()],
-        })
+        }
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        if df is not None:
+            del df
+        gc.collect()
 
 @app.route("/ping")
 def ping():
