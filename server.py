@@ -27,6 +27,7 @@ sent_signals  = {}
 active_trades = {}
 _signal_times = {}
 TRADES_FILE   = "swing_trades.json"
+_scan_running = False
 
 def save_trades():
     try:
@@ -228,9 +229,9 @@ monitor_thread = threading.Thread(target=monitor_trades, daemon=True)
 monitor_thread.start()
 
 def auto_scan_loop():
+    global _scan_running
     time.sleep(180)
     print("Swing auto-scan started.")
-    _scan_running = False
     while True:
         try:
             now      = datetime.utcnow()
@@ -261,9 +262,6 @@ def auto_scan_loop():
             _scan_running = False
             print(f"Swing scan loop error: {e}")
         time.sleep(600)
-
-scan_thread = threading.Thread(target=auto_scan_loop, daemon=True)
-scan_thread.start()
 
 @app.route("/watchlist")
 def get_watchlist():
@@ -457,5 +455,9 @@ def backtest(ticker):
 def ping():
     return "ok"
 
+scan_thread = threading.Thread(target=auto_scan_loop, daemon=True)
+scan_thread.start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
